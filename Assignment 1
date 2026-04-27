@@ -1,0 +1,713 @@
+---
+title: "Assignment 1: Decision trees and cost-effectiveness"
+author: "Abbie Raza"
+date: today
+format:
+    html:
+      toc: true
+      embed-resources: true
+editor: visual
+---
+
+```{r}
+#| warning: false
+
+# Load packages
+#.  Use install.packages("XXXX") if you don't have any of these installed
+library(rdecision) #decision trees
+library(flextable) #Formatting tables to display (https://davidgohel.github.io/flextable/reference/index.html)
+library(ggplot2) #Plotting
+library(readxl) #for read_excel()
+library(dplyr) # I use mutate at one point
+
+theme_set(theme_bw()) #Makes ggplots look better
+```
+
+# Section 1: Decision trees
+
+We'll use the [rdecision package](https://cran.r-project.org/web/packages/rdecision/index.html) to develop and visualize decision trees. There are a few vignettes on the CRAN page. [This introductory one](https://cran.rstudio.com/web/packages/rdecision/vignettes/DT00-DecisionTreeTutorial.html) will probably be sufficient for this assignment.
+
+## 1a Expected value calculations
+
+This first code chunk is just an example; you don't need to edit it. Here, using the rdecision package, I have created a decision tree, visualized it, and "rolled it back" to calculate the expected cost and QALYs associated with the two alternatives. Review it carefully, because in 1b, you'll do similar calculations for a slightly more complex decision tree.
+
+```{r}
+# Decision problem: Should we use diet or exercise to reduce chance of 
+#.   needing a stent in a high-risk population?
+
+# Parameters (stored in a list to keep R environment tidy)
+params <- list()
+params$c_diet <- 50 #cost of diet
+params$c_exercise <- 750 #cost of exercise
+params$c_stent <- 5000 #cost of a stent
+params$u_stent <- 0.75 #utility of getting a stent (relative to 1.0)
+params$p_stent_diet <- (68 - 12)/68 #probability needing stent if we diet
+params$p_stent_exercise <- (58 - 18)/58 #probability of needing a stent if we exercise
+
+#Build model using rdecision package
+
+#Create decision and chance nodes
+decision_node <- DecisionNode$new("Diet or exercise")
+chance_node_diet <- ChanceNode$new("Stent?")
+chance_node_exercise <- ChanceNode$new("Stent?")
+
+#Create leaf nodes
+leaf_node_diet_no_stent <- LeafNode$new("No stent")
+leaf_node_diet_stent <- LeafNode$new("Stent", utility = params$u_stent)
+leaf_node_exercise_no_stent <- LeafNode$new("No stent")
+leaf_node_exercise_stent <- LeafNode$new("Stent", utility = params$u_stent)
+
+#Create 'actions' (choices) that branch from the decision node
+action_diet <- Action$new(
+  decision_node, chance_node_diet, cost = params$c_diet, label = "Diet"
+)
+action_exercise <- Action$new(
+  decision_node, chance_node_exercise, cost = params$c_exercise, label = "Exercise"
+)
+
+#Create 'reactions' (chances) that branch from your chance nodes
+reaction_diet_success <- Reaction$new(
+  chance_node_diet, leaf_node_diet_no_stent, 
+  p = 1-params$p_stent_diet, cost = 0.0, label = "Did not need stent")
+
+reaction_diet_failure <- Reaction$new(
+  chance_node_diet, leaf_node_diet_stent, 
+  p = params$p_stent_diet, cost = params$c_stent, label = "Needed stent")
+
+reaction_exercise_success <- Reaction$new(
+  chance_node_exercise, leaf_node_exercise_no_stent, 
+  p = 1-params$p_stent_exercise, cost = 0.0, label = "Did not need stent")
+
+reaction_exercise_failure <- Reaction$new(
+  chance_node_exercise, leaf_node_exercise_stent, 
+  p = params$p_stent_exercise, cost = 5000.0, label = "Needed stent")
+
+#Create, draw, and evaluate the tree
+DT1 <- DecisionTree$new(
+  V = list(decision_node, #verticies (nodes)
+           chance_node_diet, 
+           chance_node_exercise, 
+           leaf_node_diet_no_stent, 
+           leaf_node_diet_stent, 
+           leaf_node_exercise_no_stent, 
+           leaf_node_exercise_stent),
+  E = list(action_diet, #edges (paths between nodes)
+           action_exercise,
+           reaction_diet_success,
+           reaction_diet_failure,
+           reaction_exercise_success,
+           reaction_exercise_failure)
+)
+
+DT1$draw() #Plot it
+
+DT1_evaluation <- DT1$evaluate() #calculate it
+DT1_evaluation |> flextable()
+```
+
+In the code chunk below, using the variables defined in the last code chunk (e.g., `params$p_stent_diet`), calculate the expected utility and the expected cost of the diet arm [**without**]{.underline} using the `rdecision` package (i.e., by summing & multiplying).
+
+```{r}
+expected_cost_diet <- params$c_diet + params$p_stent_diet * params$c_stent
+
+expected_utility_diet <- (1 - params$p_stent_diet) * 1.0 + params$p_stent_diet * params$u_stent
+
+#Print the values
+expected_cost_diet; expected_utility_diet
+```
+
+## 1b Peptic ulcer closure decision model
+
+You will now develop a decision analysis to inform whether a newer clip should be used to close bleeding peptic ulcers in the gastrointestinal tract during an upper GI endocoscopy, a procedure called EGD (stands for esophagogastroduodenoscopy). The newer clips are called over-the-scope clips, abbreviated OTSc. Randomized trial data show that rebleeding rates are lower following endoscopic closure with OTSc as compared to when standard therapy clips are used, but OTSc are significantly more expensive. You will build a decision tree to determine whether OTSc are 'worth' the added expense, either as a first line therapy (i.e. to treat all peptic ulcer bleeds initially) or only for rebleeds (i.e. only if a standard therapy clip failed, resulting in a 'rebleed').
+
+We assume all peptic ulcer bleeds are fully resolved during a short hospitalization and use a one-year time horizon. No discounting is needed due to the short time horizon.
+
+All model parameters are provided for you in the "OTSc" sheet of the excel file `params_assign1.xlsx`. You can open it to take a look. For your assignment to render without error, this .qmd file and that .xlsx file must be in the same folder. The next chunk of code reads in the .xlsx file and generates a parameter table, using the flextable package for formatting (you don't have to do anything in this code chunk).
+
+**NOTE:** You might need to close the Excel file for `read_excel()` to work.
+
+```{r}
+#read table from Excel
+t_params <- read_excel('params_assign1.xlsx', sheet = "OTSc")
+#Display it nicely
+t_params |>
+  flextable() |> #turn into flextable object
+  merge_v(j=1) |> #Merge cells in first column with same value (group probabilities, costs, etc.)
+  theme_box() |> #Apply a theme for aesthetics
+  autofit() #automatically set column widths to reasonable values
+```
+
+In the code chunk below, build the model using the rdecision package with the 'base_case' value for each parameter (we won't be using the 'lower_bound' or 'upper_bound' columns in this assignment).
+
+Your model should start with a decision mode with three options:
+
+-   **OTSc first:** use OTS clip for first line therapy. If a rebleed occurs, use a standard clip for second line therapy
+
+-   **ST first:** use a standard clip for first line therapy. If a rebleed occurs, use an OTS clip for second line therapy
+
+-   **ST only**: use a standard clip for first line therapy and, if a rebleed occurs, for second line therapy.
+
+All three branches from this decision node ("actions" in the rdecision package) lead into a chance node corresponding to the outcomes of the first line EGD. From this initial chance node, there are two possibilities:
+
+-   **Success:** no re-bleeding occurs after the first line procedure (ends in a leaf node \[also called terminal node\]).
+
+-   **Second-line therapy:** A second EGD is needed to try and close the peptic ulcer bleed (leads to a chance node corresponding to the outcome of the second line EGD).
+
+After second-line therapy, you have another chance node with two possibilities:
+
+-   **Success:** second line therapy worked (ends in a leaf node).
+
+-   **Further bleeding; IR procedure needed:** After 2 failed EGDs, patients undergo an interventional radiology procedure, which we assume is always successful (ends in a leaf node).
+
+**Costs:** You will accumulate costs along the action and reaction paths:
+
+-   In the actions from this initial decision node, patients incur the cost for the physician fee to do the EGD (`c_EGD_MD`) and the cost of whichever clip was used first under that policy (`c_STclip` or `c_OTSclip`)
+
+-   If the first line EGD was successful, we add in the cost of a hospitalization with no major complications or comorbidities (`c_hosp_noCC`).
+
+-   If the first line EGD was unsuccessful then we must perform a second-line EGD, incurring the cost of a second clip (`c_STclip` or `c_OTSclip`, depending on the strategy) and the physician fee for the second procedure (`c_EGD_MD`).
+
+-   If the second line EGD was successful, we add in the cost of a hospitalization with minor complications and comorbidities (`c_hosp_CC`)
+
+-   If the second line EGD was unsuccessful and an IR procedure was needed, we add in the cost of the IR physician fee (`c_IR_MD`), and the cost of a hospitalization with major complications/comorbidities (`c_hosp_MCC`).
+
+**Quality-adjusted life years:** We will use rdecision's default time horizon of one year. You will need to assign one of the three parameters `q_single_EGD`, `q_double_EGD`, and `q_IR` as the utility at each leaf node, depending on which procedures the patient underwent in order to arrive at that leaf. Note that `q_IR` already factors in the QALY loss from the two failed EGDs that occurred before the interventional radiology procedure.
+
+Tips:
+
+-   Draw the tree on paper before you start coding it.
+
+-   Focus on tree structure and probabilities first, plot it, and then add costs and utilities.
+
+```{r}
+# I like to turn the parameters from my table into  a named list
+# Then I can refer to the parameter I want by, e.g., `params$c_OTS`
+params <- as.list(t_params$base_case)
+names(params) <- t_params$name
+
+#Create root decision node
+decision_node <- DecisionNode$new("Clip strategy")
+
+# Create chance nodes for whether first-line therapy was successful in each scenario
+chance_first_otsc_first <- ChanceNode$new("1st-line outcome (OTSc first)")
+chance_first_st_first   <- ChanceNode$new("1st-line outcome (ST first)")
+chance_first_st_only    <- ChanceNode$new("1st-line outcome (ST only)")
+
+#Create chance nodes for whether second-line therapy was successful in each scenario
+chance_second_otsc_first <- ChanceNode$new("2nd-line outcome (OTSc first)")
+chance_second_st_first   <- ChanceNode$new("2nd-line outcome (ST first)")
+chance_second_st_only    <- ChanceNode$new("2nd-line outcome (ST only)")
+
+#Create leaf nodes
+# (9 total. "1st line success", "2nd line success", and "IR needed" for each scenario)
+
+# OTSc first (OTSc then ST)
+leaf_otsc_first_1_success <- LeafNode$new("OTSc first: 1st-line success", utility = params$q_single_EGD)
+leaf_otsc_first_2_success <- LeafNode$new("OTSc first: 2nd-line success", utility = params$q_double_EGD)
+leaf_otsc_first_ir        <- LeafNode$new("OTSc first: IR needed",        utility = params$q_IR)
+
+# ST first (ST then OTSc)
+leaf_st_first_1_success <- LeafNode$new("ST first: 1st-line success", utility = params$q_single_EGD)
+leaf_st_first_2_success <- LeafNode$new("ST first: 2nd-line success", utility = params$q_double_EGD)
+leaf_st_first_ir        <- LeafNode$new("ST first: IR needed",        utility = params$q_IR)
+
+# ST only (ST then ST)
+leaf_st_only_1_success <- LeafNode$new("ST only: 1st-line success", utility = params$q_single_EGD)
+leaf_st_only_2_success <- LeafNode$new("ST only: 2nd-line success", utility = params$q_double_EGD)
+leaf_st_only_ir        <- LeafNode$new("ST only: IR needed",        utility = params$q_IR)
+
+#Create 'actions', paths from your decision node(s).
+# (Costs here: first EGD MD fee + cost of first-line clip)
+
+action_otsc_first <- Action$new(
+  decision_node, chance_first_otsc_first,
+  cost = params$c_EGD_MD + params$c_OTSclip,
+  label = "OTSc first"
+)
+
+action_st_first <- Action$new(
+  decision_node, chance_first_st_first,
+  cost = params$c_EGD_MD + params$c_STclip,
+  label = "ST first"
+)
+
+action_st_only <- Action$new(
+  decision_node, chance_first_st_only,
+  cost = params$c_EGD_MD + params$c_STclip,
+  label = "ST only"
+)
+
+#Create 'reactions', paths from your chance node(s)
+# 12 total:
+#  - Reactions for success after first-line therapy
+#  - Reactions for failure (rebleed) after first-line therapy
+#  - Reactions for success after second-line therapy
+#  - Reactions for failure (IR needed) after second-line therapy
+
+#First line success:
+r_otsc_first_success <- Reaction$new(
+  chance_first_otsc_first, leaf_otsc_first_1_success,
+  p = 1 - params$p_OTSc_rebleed, cost = params$c_hosp_noCC,
+  label = "Success (no rebleed)"
+)
+
+r_st_first_success <- Reaction$new(
+  chance_first_st_first, leaf_st_first_1_success,
+  p = 1 - params$p_ST_rebleed, cost = params$c_hosp_noCC,
+  label = "Success (no rebleed)"
+)
+
+r_st_only_success <- Reaction$new(
+  chance_first_st_only, leaf_st_only_1_success,
+  p = 1 - params$p_ST_rebleed, cost = params$c_hosp_noCC,
+  label = "Success (no rebleed)"
+)
+
+#First line failure:
+r_otsc_first_failure <- Reaction$new(
+  chance_first_otsc_first, chance_second_otsc_first,
+  p = params$p_OTSc_rebleed, cost = params$c_EGD_MD + params$c_STclip,
+  label = "Rebleed → 2nd EGD (ST)"
+)
+
+# ST first → 2nd line uses OTSc
+r_st_first_failure <- Reaction$new(
+  chance_first_st_first, chance_second_st_first,
+  p = params$p_ST_rebleed, cost = params$c_EGD_MD + params$c_OTSclip,
+  label = "Rebleed → 2nd EGD (OTSc)"
+)
+
+# ST only → 2nd line uses ST
+r_st_only_failure <- Reaction$new(
+  chance_first_st_only, chance_second_st_only,
+  p = params$p_ST_rebleed, cost = params$c_EGD_MD + params$c_STclip,
+  label = "Rebleed → 2nd EGD (ST)"
+)
+
+#Second line success:
+r_otsc_second_success <- Reaction$new(
+  chance_second_otsc_first, leaf_otsc_first_2_success,
+  p = 1 - params$p_ST_rpt_IR, cost = params$c_hosp_CC,
+  label = "2nd-line success"
+)
+
+# success prob = 1 - p_OTSc_rpt_IR
+r_st_second_success <- Reaction$new(
+  chance_second_st_first, leaf_st_first_2_success,
+  p = 1 - params$p_OTSc_rpt_IR, cost = params$c_hosp_CC,
+  label = "2nd-line success"
+)
+
+# success prob = 1 - p_ST_rpt_IR
+r_st_only_second_success <- Reaction$new(
+  chance_second_st_only, leaf_st_only_2_success,
+  p = 1 - params$p_ST_rpt_IR, cost = params$c_hosp_CC,
+  label = "2nd-line success"
+)
+
+#Second line failure:
+r_otsc_second_failure <- Reaction$new(
+  chance_second_otsc_first, leaf_otsc_first_ir,
+  p = params$p_ST_rpt_IR, cost = params$c_IR_MD + params$c_hosp_MCC,
+  label = "Further bleed → IR"
+)
+
+r_st_second_failure <- Reaction$new(
+  chance_second_st_first, leaf_st_first_ir,
+  p = params$p_OTSc_rpt_IR, cost = params$c_IR_MD + params$c_hosp_MCC,
+  label = "Further bleed → IR"
+)
+
+r_st_only_second_failure <- Reaction$new(
+  chance_second_st_only, leaf_st_only_ir,
+  p = params$p_ST_rpt_IR, cost = params$c_IR_MD + params$c_hosp_MCC,
+  label = "Further bleed → IR"
+)
+
+#Create the tree
+DT2 <- DecisionTree$new(
+  V = list(
+    decision_node,
+    chance_first_otsc_first, chance_first_st_first, chance_first_st_only,
+    chance_second_otsc_first, chance_second_st_first, chance_second_st_only,
+    leaf_otsc_first_1_success, leaf_otsc_first_2_success, leaf_otsc_first_ir,
+    leaf_st_first_1_success,   leaf_st_first_2_success,   leaf_st_first_ir,
+    leaf_st_only_1_success,    leaf_st_only_2_success,    leaf_st_only_ir
+  ),
+  E = list(
+    action_otsc_first, action_st_first, action_st_only,
+    r_otsc_first_success, r_st_first_success, r_st_only_success,
+    r_otsc_first_failure, r_st_first_failure, r_st_only_failure,
+    r_otsc_second_success, r_st_second_success, r_st_only_second_success,
+    r_otsc_second_failure, r_st_second_failure, r_st_only_second_failure
+  )
+)
+
+# Draw the tree (uncomment after completing earlier steps)
+DT2$draw()
+
+# Create table with the expected cost and utility (in QALYs or QALD) of each alternative
+DT2_evaluation <- DT2$evaluate() #calculate it
+DT2_evaluation |> flextable()
+
+```
+
+The differences in QALYs experienced in a one-year period is hard to see. We can express the effectiveness as quality-adjusted life days lost (QALDs lost) instead of QALYs experienced. 1 QALY = 365 QALD, so 1 QALD = 1/365.I wrote the code for you; you just need to un-comment it after completing the previous code block.
+
+```{r}
+DT2_evaluation <- DT2_evaluation |>
+mutate(QALD_lost = (1 - QALY)*365)
+DT2_evaluation |> flextable()
+```
+
+Using a willingness to pay threshold of \$50,000 per QALY (\$137 per QALD), indicate whether each intervention is dominated with strong dominance, Dominated by extended dominance, not preferred, or preferred (exactly one intervention should be preferred). Indicate the ICER for any non-dominated intervention(s) in \$/QALY gained or \$/QALD gained.
+
+> ST only: dominated
+>
+> ST first: preferred strategy
+>
+> OTSc first: non-dominated but also not cost effective; ICERs way exceed WTP threshold so the more preferred method would be standard therapy first.
+>
+> **ICER (vs ST first):**
+>
+> -   ≈ \$200,000–250,000 per QALY gained
+>
+> -   ≈ \$600–700 per QALD avoided
+
+In case you're curious, this is an adapted/simplified version of [a paper I published as a PhD student](https://doi.org/10.1016/j.giec.2019.09.004).
+
+# Section 2: Economic evaluation
+
+## 2a Discounting
+
+The vector `costs_by_year` represents costs by year, starting with year 0 (this year, which should not be discounted). Calculate the net present cost with an annual discount rate of 2% and of 5%.
+
+```{r}
+
+costs_by_year <- c(100, 200, 500, 350, 700) #costs 0, 1, 2, 3, and 4 years into the future
+
+npc_2percent <- sum(costs_by_year / (1.02 ^ (0:(length(costs_by_year) - 1)))) #Calculate the net present cost with a discount rate of 2 percent
+
+npc_5percent <- sum(costs_by_year / (1.05 ^ (0:(length(costs_by_year) - 1)))) #Calculate the net present cost with a discount rate of 5 percent
+
+npc_2percent; npc_5percent
+```
+
+## 2b Incremental analysis
+
+In this section, we'll use loops to conduct incremental analysis, the process of identifying dominated strategies and calculating the incremental cost-effectiveness ratios (ICERs) between any non-dominated strategies. Coding this yourself should give you a strong understanding of the concept. Let's get started!
+
+First, I've written the code for you that reads in the data on 9 different strategies we wish to compare (from the params_assign1.xlsx file). For each strategy, you are provided with the estimated QALYs experienced and the estimated cost across three categories: costs paid by the insurer, out-of-pocket costs paid by the patient, and the cost of lost productivity.
+
+```{r}
+#No edits needed to this code chunk
+
+#read table from Excel
+t_CE <- read_excel('params_assign1.xlsx', sheet = "CEdata")
+#Display it nicely
+t_CE |>
+  flextable() |> #turn into flextable object
+  theme_box() |> #Apply a theme for aesthetics
+  autofit() #automatically set column widths to reasonable values
+```
+
+**Insurer perspective:** In this code chunk, you'll calculate the cost-effectiveness from the insurer's perspective (only including costs in the `Cost_insurer` column). First, we detect any strategies that are dominated by strong dominance, then, we check for costs that are dominated by extended dominance. Lastly, we calculate the ICERs between all non-dominated interventions. I've provided some of the code, but you'll need to complete it.
+
+```{r}
+#Create table with columns "strategy", "QALYs", and "Cost", where cost is 
+#.  the Cost_insurer. We'll add two columns, one for whether the strategy 
+#.  is dominated and another for putting the ICERS for non-dominated 
+#.  interventions. No edits needed.
+
+t_ICERS <- data.frame(
+  Strategy = t_CE$Strategy,
+  QALYs = t_CE$QALYs,
+  Cost = t_CE$Cost_insurer,
+  Dominated = "No", #we will check and some to 'yes' if dominated in the for loop below
+  ICER = 0.0
+)
+
+#Sort t_ICERS ascending by QALYs (from low to high)
+t_ICERS <- t_ICERS[order(t_ICERS$QALYs), ] #EDIT THIS
+
+#We need to reset the row index names
+row.names(t_ICERS) <- NULL
+
+# loop through rows to identify dominated strategies.
+
+continue = T #restart 
+
+while(continue){
+  continue = F 
+  idx_nondom_rows <- as.numeric(rownames(t_ICERS[t_ICERS$Dominated=="No",]))
+  n_nondom <- length(idx_nondom_rows) #EDIT THIS
+  
+  #loop over each row starting with the second non-dominated row
+  # compare it to previous non-dominated row to see if it is dominated
+  for (i in 2:n_nondom){
+    row_this <- idx_nondom_rows[i] #index of the current row
+    row_last <- idx_nondom_rows[i-1] #index of last undominated row
+    
+    if (t_ICERS[row_this,"Cost"] <= t_ICERS[row_last,"Cost"]){
+      # set Dominated value to "Strong"
+      t_ICERS[row_last,"Dominated"] <- "Strong"
+      # set ICER value to NA
+      t_ICERS[row_last,"ICER"] <- NA
+      # set continue to T so that we do another loop
+      continue <- T
+
+    }
+  }
+}
+
+
+continue = T
+
+while(continue){
+  continue = F #exits loop if no dominated strategies found
+  
+
+  idx_nondom_rows <- as.numeric(rownames(t_ICERS[t_ICERS$Dominated=="No",]))
+  
+  #Get number of non-dominated rows
+  n_nondom <- length(idx_nondom_rows) #EDIT THIS
+  
+  #loop over each row starting with the second non-dominated row
+  # compare it to previous non-dominated row to see if it is extended dominated
+  for (i in 2:n_nondom){
+    row_this <- idx_nondom_rows[i]
+    row_last <- idx_nondom_rows[i-1] 
+
+    #Calculate ICER for row_this compared to last non-dominated row
+    # Put it in t_ICERS[row_this,"ICER"]
+    t_ICERS[row_this,"ICER"] <-
+      (t_ICERS[row_this,"Cost"] - t_ICERS[row_last,"Cost"]) /
+      (t_ICERS[row_this,"QALYs"] - t_ICERS[row_last,"QALYs"])
+      
+    if(i >= 3 && t_ICERS[row_this,"ICER"] <= t_ICERS[row_last,"ICER"]){ 
+      t_ICERS[row_last,"Dominated"] <- "Extended"
+      
+      # set ICER value to NA
+      t_ICERS[row_last,"ICER"] <- NA
+      
+      # set continue to T to loop
+      continue <- T
+
+  
+      break
+      
+    }
+  }
+}
+
+#Display
+t_ICERS |>
+  flextable() |> #turn into flextable object
+  theme_box() |> #Apply a theme for aesthetics
+  autofit() #automatically set column widths to reasonable values
+
+
+```
+
+**Function-ize it:** The following code chunk contains the shell of a function that takes vectors `strategy_name`, `cost`, and `QALY`, puts them into a table `t_ICERs`, does calculations, and then returns the table with ICER and dominated columns added. Complete the function by pasting/adapting the code you wrote in the previous code chunk
+
+```{r}
+
+#INPUT: 3 equal-length vectors strategy_name, cost, and QALYs
+#OUTPUT: A data.frame with a column for each of the input vectors,
+#.  plus new "Dominated" and "ICER" columns
+generate_ICER_table <- function(strategy_name, cost, QALYs){
+  t_ICERs <- data.frame(
+    Strategy = strategy_name,
+    QALYs = QALYs,
+    Cost = cost,
+    Dominated = "No",
+    ICER = 0.0
+  )
+  
+  #Conduct incremental analysis. Add Dominated and ICER columns to t_ICERs
+  
+  #Sort t_ICERs ascending by QALYs (from low to high)
+  t_ICERs <- t_ICERs[order(t_ICERs$QALYs), ]
+  
+  #We need to reset the row index names
+  row.names(t_ICERs) <- NULL
+  
+  ### REMOVE INTERVENTIONS DOMINATED BY STRONG DOMINANCE
+  # We have to loop through rows to identify dominated strategies. If we find 
+  #.  any, we need to look through them again in case there are more, so we 
+  #.  use a while loop.
+  
+  continue = T #If this is still T at the end of the while loop, it will restart
+  
+  while(continue){
+    continue = F #if no dominated strategies found in for loop below, exit while loop
+    
+    #Get the row index for all rows that aren't dominated
+    idx_nondom_rows <- as.numeric(rownames(t_ICERs[t_ICERs$Dominated=="No",]))
+    
+    #Get number of non-dominated rows
+    n_nondom <- length(idx_nondom_rows)
+    
+    #LOOP over each row starting with the second non-dominated row
+    # compare it to previous non-dominated row to see if it is dominated
+    for (i in 2:n_nondom){
+      row_this <- idx_nondom_rows[i] #index of the current row
+      row_last <- idx_nondom_rows[i-1] #index of last undominated row
+      
+      if (t_ICERs[row_this,"Cost"] <= t_ICERs[row_last,"Cost"]){ #Replace 'F' with the test to determine if row_this is dominated
+        #Strategy in row t_ICERs[row_last, ] is strong dominated
+        # set Dominated value to "Strong"
+        t_ICERs[row_last,"Dominated"] <- "Strong"
+        # set ICER value to NA
+        t_ICERs[row_last,"ICER"] <- NA
+        # set continue to T so that we do another loop
+        continue <- T
+      }
+    }
+  }
+  
+  ### REMOVE INTERVENTIONS DOMINATED BY EXTENDED DOMINANCE
+  # We have to loop through rows to identify extended dominated strategies. 
+  #.  If we find any, we need to loop through again in case there are more.
+  #.  We will use a while loop.
+  
+  continue = T
+  
+  while(continue){
+    continue = F #if no dominated strategies found, exit loop
+    
+    #Get the row index for all rows that aren't dominated
+    idx_nondom_rows <- as.numeric(rownames(t_ICERs[t_ICERs$Dominated=="No",]))
+    
+    #Get number of non-dominated rows
+    n_nondom <- length(idx_nondom_rows)
+    
+    #LOOP over each row starting with the second non-dominated row
+    # compare it to previous non-dominated row to see if it is extended dominated
+    for (i in 2:n_nondom){
+      row_this <- idx_nondom_rows[i] #index of the current row
+      row_last <- idx_nondom_rows[i-1] #index of last undominated row
+      
+      #Calculate ICER for row_this compared to last non-dominated row
+      # Put it in t_ICERs[row_this,"ICER"]
+      
+      #YOUR CODE HERE
+      t_ICERs[row_this,"ICER"] <-
+        (t_ICERs[row_this,"Cost"] - t_ICERs[row_last,"Cost"]) /
+        (t_ICERs[row_this,"QALYs"] - t_ICERs[row_last,"QALYs"])
+      
+      if(i >= 3 && t_ICERs[row_this,"ICER"] <= t_ICERs[row_last,"ICER"]){ #Replace 'F' with the test to determine if row_this is dominated
+        #Strategy in row t_ICERs[row_last, ] is extended dominated
+        # set Dominated value to "Extended"
+        t_ICERs[row_last,"Dominated"] <- "Extended"
+        
+        # set ICER value to NA
+        t_ICERs[row_last,"ICER"] <- NA
+        
+        # set continue to T so that we do another loop
+        continue <- T
+        break
+      }
+    }
+  }
+  
+  return(t_ICERs)
+}
+
+```
+
+**Other perspectives:** using the function above, complete the incremental analysis from three cost perspectives:
+
+-   **Insurer:** as above
+-   **Healthcare costs** includes insurer and patient out-of-pocket costs
+-   **Societal:** healthcare costs plus productivity loss
+
+```{r}
+
+t_ICER_insurer <- generate_ICER_table(
+  strategy_name = t_CE$Strategy,
+  cost = t_CE$Cost_insurer,
+  QALYs = t_CE$QALYs
+)
+
+t_ICER_healthcare_cost <- generate_ICER_table(
+  strategy_name = t_CE$Strategy,
+  cost = t_CE$Cost_insurer + t_CE$Cost_patient,
+  QALYs = t_CE$QALYs
+)
+
+t_ICER_societal <- generate_ICER_table(
+  strategy_name = t_CE$Strategy,
+  cost = t_CE$Cost_insurer + t_CE$Cost_patient + t_CE$Cost_productivity,
+  QALYs = t_CE$QALYs
+)
+
+#Display them nicely
+
+#INSURER PERSPECTIVE
+t_ICER_insurer |>
+  flextable() |> #turn into flextable object
+  theme_box() |> #Apply a theme for aesthetics
+  autofit() #automatically set column widths to reasonable values
+
+# HEALTHCARE PERSPECTIVE 
+t_ICER_healthcare_cost |>
+  flextable() |> #turn into flextable object
+  theme_box() |> #Apply a theme for aesthetics
+  autofit() #automatically set column widths to reasonable values
+
+# SOCIETAL PERSPECTIVE 
+t_ICER_societal |>
+  flextable() |> #turn into flextable object
+  theme_box() |> #Apply a theme for aesthetics
+  autofit() #automatically set column widths to reasonable values
+```
+
+## 2c Maximizing net monetary benefit (NMB)
+
+Calculate NMB at a range of WTP thresholds ***from a societal perspective***, and then plot them.
+
+```{r}
+
+#Vector of willingness-to-pay values for which to calcualte NMB
+wtp_vec = seq(0, 2.5e5, 1e5)
+
+#Calcualte societal cost and add it as a column to the t_CE table
+t_CE$cost_societal <- t_CE$Cost_insurer + t_CE$Cost_patient + t_CE$Cost_productivity
+
+#Create a table for plot with relevant columns (no need to edit)
+t_nmb_plot <- data.frame(
+  strategy = rep(t_CE$Strategy, each = length(wtp_vec)),
+  wtp = rep(wtp_vec, times = nrow(t_CE)),
+  cost = rep(t_CE$cost_societal, each = length(wtp_vec)),
+  QALYs = rep(t_CE$QALYs, each = length(wtp_vec))
+)
+
+#Calculate NMB as new column in t_nmb_plot
+t_nmb_plot$NMB <- t_nmb_plot$wtp * t_nmb_plot$QALYs - t_nmb_plot$cost
+
+
+#Plot  with ggplot (no need to edit)
+ggplot(t_nmb_plot, aes(x = wtp, y = NMB, color = strategy))+
+  geom_line()
+
+```
+
+Comparing the net monetary benefit plot to your incremental analysis from the societal perspective, you should observe the following that:
+
+-   All non-dominated interventions maximize NMB for some willingness-to-pay level (i.e., their line is the highest on the Y axis for some segment of the X axis).
+
+-   There is no willingness-to-pay level at which a dominated intervention maximizes WTP (this is one definition of dominated)
+
+On the NMB plot, what is the significance or meaning of the willingness-to-pay level at which the lines of two non-dominated interventions cross? (Hint: can compare the NMB plot to your incremental analysis table.
+
+> Your answer here. \[NEED TO ANSWER STILL\]
+
+# Last two questions
+
+-   About how much time did you spend on the assignment? **5 hours**
+
+-   Did you find any errors or have suggestions to improve it? Nothing, but it would be nice to see example code for while loops?
+
+Fin.
